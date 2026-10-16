@@ -1,0 +1,162 @@
+
+version: 2.1
+
+jobs:
+  qa_pipeline:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/urlshorter
+          REDIS_URL: redis://localhost:6379/0
+
+      - image: cimg/postgres:16.4
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: urlshorter
+
+      - image: cimg/redis:7.2
+
+    environment:
+      IMAGE_NAME: url-shorter
+
+    steps:
+      - checkout
+
+      # 1. Secret scanning
+      - run:
+          name: Scan repository for secrets
+          command: |
+            GITLEAKS_VERSION=8.24.2
+            curl -sSfL \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+              -o /tmp/gitleaks.tar.gz
+            mkdir -p /tmp/gitleaks
+            tar -xzf /tmp/gitleaks.tar.gz -C /tmp/gitleaks
+            /tmp/gitleaks/gitleaks detect \
+              --source . \
+              --verbose \
+              --redact \
+              --exit-code 1
+
+      # 2. Lint
+      - run:
+          name: Install lint and test tools
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install pytest httpx ruff
+
+      - run:
+          name: Run Python lint
+          command: ruff check .
+
+      # 3. Unit tests
+      - run:
+          name: Run unit tests
+          command: python -m pytest -v tests/test_state.py
+
+      # 4. Integration tests with real service containers
+      - run:
+          name: Wait for PostgreSQL and Redis
+          command: |
+            for i in $(seq 1 60); do
+              if (echo > /dev/tcp/localhost/5432) 2>/dev/null && \
+                 (echo > /dev/tcp/localhost/6379) 2>/dev/null; then
+                echo "PostgreSQL and Redis are accepting connections."
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Timed out waiting for PostgreSQL or Redis."
+            exit 1
+
+      - run:
+          name: Run integration tests
+          command: python -m pytest -v tests/test_integration.py
+
+      # 5. Build and 6. Push the QA image
+      - setup_remote_docker
+
+      - run:
+          name: Build and push QA image
+          command: |
+            set -euo pipefail
+
+            : "${DOCKERHUB_USER:?Set DOCKERHUB_USER in CircleCI}"
+            : "${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN in CircleCI}"
+
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            IMMUTABLE_TAG="${CIRCLE_BRANCH}-${SHORT_SHA}"
+            IMAGE="${DOCKERHUB_USER}/${IMAGE_NAME}"
+
+            docker build -t "${IMAGE}:qa" \
+              -t "${IMAGE}:${IMMUTABLE_TAG}" .
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USER" --password-stdin
+
+            docker push "${IMAGE}:qa"
+            docker push "${IMAGE}:${IMMUTABLE_TAG}"
+
+            docker logout
+
+  build_publish:
+    docker:
+      - image: cimg/python:3.12
+
+    environment:
+      IMAGE_NAME: url-shorter
+
+    steps:
+      - checkout
+      - setup_remote_docker
+
+      - run:
+          name: Build and push stage or production image
+          command: |
+            set -euo pipefail
+
+            : "${DOCKERHUB_USER:?Set DOCKERHUB_USER in CircleCI}"
+            : "${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN in CircleCI}"
+
+            case "$CIRCLE_BRANCH" in
+              staging) MOVING_TAG="stage" ;;
+              prod)    MOVING_TAG="prod" ;;
+              *)
+                echo "Unsupported branch: $CIRCLE_BRANCH"
+                exit 1
+                ;;
+            esac
+
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            IMMUTABLE_TAG="${CIRCLE_BRANCH}-${SHORT_SHA}"
+            IMAGE="${DOCKERHUB_USER}/${IMAGE_NAME}"
+
+            docker build -t "${IMAGE}:${MOVING_TAG}" \
+              -t "${IMAGE}:${IMMUTABLE_TAG}" .
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USER" --password-stdin
+
+            docker push "${IMAGE}:${MOVING_TAG}"
+            docker push "${IMAGE}:${IMMUTABLE_TAG}"
+
+            docker logout
+
+workflows:
+  qa_workflow:
+    jobs:
+      - qa_pipeline:
+          filters:
+            branches:
+              only: main
+
+  promotion_build_workflow:
+    jobs:
+      - build_publish:
+          filters:
+            branches:
+              only:
+                - staging
+                - prod
